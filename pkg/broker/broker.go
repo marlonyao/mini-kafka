@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	mini "github.com/marlonyao/mini-kafka/pkg"
@@ -43,6 +44,7 @@ type Broker struct {
 	dataDir   string                       // 数据持久化目录
 	mu        sync.RWMutex
 	quit      chan struct{}
+	offsetMu  sync.Mutex                    // offset 文件写锁
 }
 
 // consumerGroupEntry 消费者组条目
@@ -68,11 +70,12 @@ func NewBroker(addr string, dataDir string) *Broker {
 
 // Start 启动 Broker（阻塞运行）
 func (b *Broker) Start() error {
-	// 如果配置了 dataDir，启动时恢复已有 topic
+	// 如果配置了 dataDir，启动时恢复已有 topic 和 offset
 	if b.dataDir != "" {
 		if err := b.loadTopicsFromDisk(); err != nil {
 			log.Printf("[Broker] warning: load topics from disk failed: %v", err)
 		}
+		b.loadOffsets()
 	}
 
 	var err error
@@ -385,6 +388,9 @@ func (b *Broker) handleCommitOffset(payload []byte) *protocol.Response {
 	log.Printf("[Broker] committed offset: group=%s, topic=%s, partition=%d, offset=%d",
 		req.GroupID, req.Topic, req.Partition, req.Offset)
 
+	// 持久化到磁盘
+	b.saveOffsets()
+
 	return okResponse(nil)
 }
 
@@ -411,6 +417,100 @@ func (b *Broker) handleFetchOffset(payload []byte) *protocol.Response {
 }
 
 // ─── 辅助方法 ────────────────────────────────────
+
+// offsetFilePath 返回 offset 持久化文件路径
+func (b *Broker) offsetFilePath() string {
+	if b.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(b.dataDir, "__consumer_offsets.json")
+}
+
+// saveOffsets 将所有 consumer group offset 持久化到磁盘
+func (b *Broker) saveOffsets() {
+	path := b.offsetFilePath()
+	if path == "" {
+		return // 纯内存模式
+	}
+
+	b.mu.RLock()
+	data := make(map[string]map[string]map[int]int64) // group → topic → partition → offset
+	for key, co := range b.offsets {
+		// key 格式: "group:topic"
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		group, topic := parts[0], parts[1]
+		partitions := co.AllPartitions(group, topic)
+		if len(partitions) > 0 {
+			if data[group] == nil {
+				data[group] = make(map[string]map[int]int64)
+			}
+			data[group][topic] = partitions
+		}
+	}
+	b.mu.RUnlock()
+
+	b.offsetMu.Lock()
+	defer b.offsetMu.Unlock()
+
+	// 写入临时文件再 rename（原子操作）
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		log.Printf("[Broker] warning: create offset file failed: %v", err)
+		return
+	}
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(data); err != nil {
+		f.Close()
+		log.Printf("[Broker] warning: write offset file failed: %v", err)
+		return
+	}
+	f.Close()
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		log.Printf("[Broker] warning: rename offset file failed: %v", err)
+	}
+}
+
+// loadOffsets 从磁盘恢复 consumer group offset
+func (b *Broker) loadOffsets() {
+	path := b.offsetFilePath()
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[Broker] warning: read offset file failed: %v", err)
+		}
+		return // 文件不存在是正常的（首次启动）
+	}
+
+	var parsed map[string]map[string]map[int]int64
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		log.Printf("[Broker] warning: parse offset file failed: %v", err)
+		return
+	}
+
+	for group, topics := range parsed {
+		for topic, partitions := range topics {
+			key := group + ":" + topic
+			co := mini.NewConsumerOffset()
+			for p, o := range partitions {
+				co.Commit(group, topic, p, o)
+			}
+			b.offsets[key] = co
+		}
+	}
+
+	log.Printf("[Broker] restored consumer offsets from disk")
+}
 
 // loadTopicsFromDisk 从 dataDir 恢复已有 topic
 //

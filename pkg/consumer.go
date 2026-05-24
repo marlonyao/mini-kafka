@@ -86,6 +86,21 @@ func (co *ConsumerOffset) Get(group, topic string, partition int) int64 {
 	return co.offsets[k][partition]
 }
 
+// AllPartitions 返回指定 group:topic 的所有分区 offset（用于持久化）
+func (co *ConsumerOffset) AllPartitions(group, topic string) map[int]int64 {
+	co.mu.RLock()
+	defer co.mu.RUnlock()
+	k := co.key(group, topic)
+	if co.offsets[k] == nil {
+		return nil
+	}
+	result := make(map[int]int64, len(co.offsets[k]))
+	for p, o := range co.offsets[k] {
+		result[p] = o
+	}
+	return result
+}
+
 // Consumer Kafka 消费者
 //
 // 对应 Kafka 的 KafkaConsumer。
