@@ -164,58 +164,93 @@ func runConsume() {
 		fmt.Printf("👥 加入消费者组 '%s', 分配分区: %v\n", *group, assigned)
 	}
 
-	currentOffset := *startOffset
-	if currentOffset < 0 {
-		if *group != "" {
-			committed, err := c.FetchOffset(*partition)
+
+	// 确定要消费的分区列表
+	var partitions []int
+	if *group != "" && *partition == 0 && *startOffset < 0 {
+		// 消费者组模式 + 未指定分区 → 轮询所有分配到的分区
+		assigned, _ := c.JoinGroup() // 已加入过，这里获取分配结果
+		if len(assigned) > 0 {
+			partitions = assigned
+		} else {
+			partitions = []int{*partition}
+		}
+	} else {
+		partitions = []int{*partition}
+	}
+
+	// 每个分区维护独立的 offset
+	offsets := make(map[int]int64)
+	for _, p := range partitions {
+		if *startOffset >= 0 {
+			offsets[p] = *startOffset
+		} else if *group != "" {
+			committed, err := c.FetchOffset(p)
 			if err == nil {
-				currentOffset = committed
-				fmt.Printf("📍 从已提交 offset=%d 开始\n", currentOffset)
+				offsets[p] = committed
 			} else {
-				currentOffset = 0
+				offsets[p] = 0
 			}
 		} else {
-			currentOffset = 0
+			offsets[p] = 0
 		}
 	}
 
 	if *follow {
-		fmt.Printf("🔄 持续消费 %s P%d (Ctrl+C 停止)\n\n", topic, *partition)
+		if len(partitions) > 1 {
+			fmt.Printf("🔄 持续消费 %s 分区%v (Ctrl+C 停止)\n\n", topic, partitions)
+		} else {
+			fmt.Printf("🔄 持续消费 %s P%d (Ctrl+C 停止)\n\n", topic, partitions[0])
+		}
 		for {
-			msgs, err := c.Poll(*partition, currentOffset, *maxCount)
-			if err != nil {
-				log.Printf("拉取失败: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
+			totalMsgs := 0
+			for _, p := range partitions {
+				msgs, err := c.Poll(p, offsets[p], *maxCount)
+				if err != nil {
+					log.Printf("P%d 拉取失败: %v", p, err)
+					continue
+				}
+				for _, m := range msgs {
+					printMsg(&m)
+					offsets[p] = m.Offset + 1
+					totalMsgs++
+				}
+				if *group != "" && len(msgs) > 0 {
+					c.CommitOffset(p, offsets[p])
+				}
 			}
-			for _, m := range msgs {
-				printMsg(&m)
-				currentOffset = m.Offset + 1
-			}
-			if *group != "" && len(msgs) > 0 {
-				c.CommitOffset(*partition, currentOffset)
-			}
-			if len(msgs) == 0 {
+			if totalMsgs == 0 {
 				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	} else {
-		msgs, err := c.Poll(*partition, currentOffset, *maxCount)
-		if err != nil {
-			log.Fatalf("❌ 拉取失败: %v", err)
+		// 一次性拉取所有分区
+		var allMsgs []protocol.FetchedMessage
+		for _, p := range partitions {
+			msgs, err := c.Poll(p, offsets[p], *maxCount)
+			if err != nil {
+				log.Fatalf("❌ P%d 拉取失败: %v", p, err)
+			}
+			for _, m := range msgs {
+				offsets[p] = m.Offset + 1
+			}
+			allMsgs = append(allMsgs, msgs...)
 		}
-		if len(msgs) == 0 {
+		if len(allMsgs) == 0 {
 			fmt.Println("📭 没有消息")
 			return
 		}
-		fmt.Printf("📥 拉取到 %d 条消息:\n", len(msgs))
-		for i := range msgs {
-			printMsg(&msgs[i])
+		fmt.Printf("📥 拉取到 %d 条消息:\n", len(allMsgs))
+		for i := range allMsgs {
+			printMsg(&allMsgs[i])
 		}
 		if *group != "" {
-			lastOff := msgs[len(msgs)-1].Offset + 1
-			c.CommitOffset(*partition, lastOff)
-			fmt.Printf("\n💾 已提交 offset=%d\n", lastOff)
+			for _, p := range partitions {
+				if offsets[p] > 0 {
+					c.CommitOffset(p, offsets[p])
+				}
+			}
+			fmt.Printf("\n💾 已提交所有分区 offset\n")
 		}
 	}
 }
