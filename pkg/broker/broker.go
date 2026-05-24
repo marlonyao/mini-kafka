@@ -114,15 +114,39 @@ func (b *Broker) handleConn(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Printf("[Broker] new connection from %s", remoteAddr)
 
+	// 跟踪该连接加入的消费者组，断开时自动清理
+	var joinedGroups []struct {
+		groupID string
+		addr     string
+	}
+
+	defer func() {
+		// 连接断开时，自动从所有消费者组中移除
+		for _, g := range joinedGroups {
+			b.removeConsumerFromGroup(g.groupID, g.addr)
+		}
+	}()
+
 	for {
 		reqType, payload, err := protocol.ReadRequest(conn)
 		if err != nil {
-			// 连接关闭或读取错误，退出循环
 			log.Printf("[Broker] connection %s closed: %v", remoteAddr, err)
 			return
 		}
 
 		resp := b.handleRequest(reqType, payload)
+
+		// 记录 JoinGroup，用于断开时自动清理
+		if reqType == protocol.JoinGroupRequest && resp.Status == protocol.ResponseOK {
+			var req protocol.JoinGroupRequestData
+			if json.Unmarshal(payload, &req) == nil {
+				joinedGroups = append(joinedGroups, struct {
+					groupID string
+					addr     string
+				}{groupID: req.GroupID, addr: req.Addr})
+			}
+		}
+
 		if err := protocol.WriteResponse(conn, resp); err != nil {
 			log.Printf("[Broker] write response to %s: %v", remoteAddr, err)
 			return
@@ -368,6 +392,27 @@ func (b *Broker) handleFetchOffset(payload []byte) *protocol.Response {
 }
 
 // ─── 辅助方法 ────────────────────────────────────
+
+// removeConsumerFromGroup 从消费者组中移除消费者（连接断开时调用）
+func (b *Broker) removeConsumerFromGroup(groupID, addr string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	group, ok := b.groups[groupID]
+	if !ok {
+		log.Printf("[Broker] cleanup: group '%s' not found for consumer %s", groupID, addr)
+		return
+	}
+
+	delete(group.consumers, addr)
+	log.Printf("[Broker] consumer %s disconnected, removed from group '%s' (remaining: %d)",
+		addr, groupID, len(group.consumers))
+
+	if len(group.consumers) == 0 {
+		delete(b.groups, groupID)
+		log.Printf("[Broker] group '%s' is empty, cleaned up", groupID)
+	}
+}
 
 // assignPartitions 分配分区给消费者组（Range Assignor）
 //

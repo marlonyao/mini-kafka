@@ -140,7 +140,6 @@ func runConsume() {
 	startOffset := fs.Int64("o", -1, "起始 offset (-1=从已提交 offset 开始)")
 	maxCount := fs.Int("n", 10, "最多拉取条数")
 	follow := fs.Bool("f", false, "持续消费模式")
-	// 把 flags 放到 args 前面重新排列，确保 flag 能被正确解析
 	reordered := reorderArgs(os.Args[2:])
 	fs.Parse(reordered)
 
@@ -156,23 +155,22 @@ func runConsume() {
 	}
 	defer c.Close()
 
+	// 加入消费者组（只调用一次）
+	var assignedPartitions []int
 	if *group != "" {
-		assigned, err := c.JoinGroup()
+		assignedPartitions, err = c.JoinGroup()
 		if err != nil {
 			log.Fatalf("❌ 加入消费者组失败: %v", err)
 		}
-		fmt.Printf("👥 加入消费者组 '%s', 分配分区: %v\n", *group, assigned)
+		fmt.Printf("👥 加入消费者组 '%s', 分配分区: %v\n", *group, assignedPartitions)
 	}
-
 
 	// 确定要消费的分区列表
 	var partitions []int
 	if *group != "" && *partition == 0 && *startOffset < 0 {
 		// 消费者组模式 + 未指定分区 → 轮询所有分配到的分区
-		assigned, _ := c.JoinGroup() // 已加入过，这里获取分配结果
-		if len(assigned) > 0 {
-			partitions = assigned
-		} else {
+		partitions = assignedPartitions
+		if len(partitions) == 0 {
 			partitions = []int{*partition}
 		}
 	} else {
