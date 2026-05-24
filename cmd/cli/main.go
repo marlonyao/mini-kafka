@@ -1,14 +1,11 @@
 // Mini-Kafka 命令行客户端
 //
 // 用法：
-//   BROKER=localhost:9092 go run main.go create-topic orders -p 3
-//   BROKER=localhost:9092 go run main.go produce orders "hello world"
-//   BROKER=localhost:9092 go run main.go consume orders -p 0 -n 10
+//   go run main.go create-topic orders -p 3
+//   go run main.go produce orders "hello world"
+//   go run main.go consume orders -g mygroup -f
 //
-// 或者：
-//   go run main.go create-topic orders -p 3              (默认连接 localhost:9092)
-//   go run main.go produce orders "hello" -k user1
-//   go run main.go consume orders -p 0 -n 10 -g mygroup
+// Broker 地址通过环境变量 BROKER 指定（默认 localhost:9092）
 package main
 
 import (
@@ -64,9 +61,8 @@ func printUsage() {
 	fmt.Println("  consume <topic> [-g group] [-p 0] [-n 10] [-f] 拉取消息")
 	fmt.Println()
 	fmt.Println("示例:")
-	fmt.Println("  BROKER=localhost:9092 go run main.go create-topic orders -p 3")
+	fmt.Println("  go run main.go create-topic orders -p 3")
 	fmt.Println("  go run main.go produce orders 'hello' -k user1")
-	fmt.Println("  go run main.go consume orders -p 0 -n 10")
 	fmt.Println("  go run main.go consume orders -g mygroup -f")
 }
 
@@ -148,41 +144,50 @@ func runConsume() {
 		os.Exit(1)
 	}
 	topic := fs.Arg(0)
+	brokerAddr := getBrokerAddr()
 
-	c, err := client.NewClientConsumer(getBrokerAddr(), *group, topic)
+	// 连接并初始化
+	c, partitions, offsets := initConsumer(brokerAddr, topic, *group, *partition, *startOffset)
+	defer c.Close()
+
+	if *follow {
+		runFollow(c, topic, partitions, offsets, *group, *maxCount, brokerAddr)
+	} else {
+		runOnce(c, partitions, offsets, *group, *maxCount)
+	}
+}
+
+// initConsumer 创建连接、加入组、确定分区和 offset
+func initConsumer(brokerAddr, topic, group string, partition int, startOffset int64) (*client.ClientConsumer, []int, map[int]int64) {
+	c, err := client.NewClientConsumer(brokerAddr, group, topic)
 	if err != nil {
 		log.Fatalf("❌ 连接 Broker 失败: %v", err)
 	}
-	defer c.Close()
 
-	// 加入消费者组（只调用一次）
 	var assignedPartitions []int
-	if *group != "" {
+	if group != "" {
 		assignedPartitions, err = c.JoinGroup()
 		if err != nil {
 			log.Fatalf("❌ 加入消费者组失败: %v", err)
 		}
-		fmt.Printf("👥 加入消费者组 '%s', 分配分区: %v\n", *group, assignedPartitions)
+		fmt.Printf("👥 加入消费者组 '%s', 分配分区: %v\n", group, assignedPartitions)
 	}
 
-	// 确定要消费的分区列表
 	var partitions []int
-	if *group != "" && *partition == 0 && *startOffset < 0 {
-		// 消费者组模式 + 未指定分区 → 轮询所有分配到的分区
+	if group != "" && partition == 0 && startOffset < 0 {
 		partitions = assignedPartitions
 		if len(partitions) == 0 {
-			partitions = []int{*partition}
+			partitions = []int{partition}
 		}
 	} else {
-		partitions = []int{*partition}
+		partitions = []int{partition}
 	}
 
-	// 每个分区维护独立的 offset
 	offsets := make(map[int]int64)
 	for _, p := range partitions {
-		if *startOffset >= 0 {
-			offsets[p] = *startOffset
-		} else if *group != "" {
+		if startOffset >= 0 {
+			offsets[p] = startOffset
+		} else if group != "" {
 			committed, err := c.FetchOffset(p)
 			if err == nil {
 				offsets[p] = committed
@@ -194,62 +199,143 @@ func runConsume() {
 		}
 	}
 
-	if *follow {
-		if len(partitions) > 1 {
-			fmt.Printf("🔄 持续消费 %s 分区%v (Ctrl+C 停止)\n\n", topic, partitions)
-		} else {
-			fmt.Printf("🔄 持续消费 %s P%d (Ctrl+C 停止)\n\n", topic, partitions[0])
-		}
-		for {
-			totalMsgs := 0
-			for _, p := range partitions {
-				msgs, err := c.Poll(p, offsets[p], *maxCount)
-				if err != nil {
-					log.Printf("P%d 拉取失败: %v", p, err)
-					continue
-				}
-				for _, m := range msgs {
-					printMsg(&m)
-					offsets[p] = m.Offset + 1
-					totalMsgs++
-				}
-				if *group != "" && len(msgs) > 0 {
-					c.CommitOffset(p, offsets[p])
-				}
-			}
-			if totalMsgs == 0 {
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
+	return c, partitions, offsets
+}
+
+// runFollow 持续消费模式，支持断线重连
+func runFollow(c *client.ClientConsumer, topic string, partitions []int, offsets map[int]int64, group string, maxCount int, brokerAddr string) {
+	if len(partitions) > 1 {
+		fmt.Printf("🔄 持续消费 %s 分区%v (Ctrl+C 停止)\n\n", topic, partitions)
 	} else {
-		// 一次性拉取所有分区
-		var allMsgs []protocol.FetchedMessage
+		fmt.Printf("🔄 持续消费 %s P%d (Ctrl+C 停止)\n\n", topic, partitions[0])
+	}
+
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 3
+
+	for {
+		totalMsgs := 0
+		hadError := false
+
 		for _, p := range partitions {
-			msgs, err := c.Poll(p, offsets[p], *maxCount)
+			msgs, err := c.Poll(p, offsets[p], maxCount)
 			if err != nil {
-				log.Fatalf("❌ P%d 拉取失败: %v", p, err)
-			}
-			for _, m := range msgs {
-				offsets[p] = m.Offset + 1
-			}
-			allMsgs = append(allMsgs, msgs...)
-		}
-		if len(allMsgs) == 0 {
-			fmt.Println("📭 没有消息")
-			return
-		}
-		fmt.Printf("📥 拉取到 %d 条消息:\n", len(allMsgs))
-		for i := range allMsgs {
-			printMsg(&allMsgs[i])
-		}
-		if *group != "" {
-			for _, p := range partitions {
-				if offsets[p] > 0 {
-					c.CommitOffset(p, offsets[p])
+				consecutiveErrors++
+				hadError = true
+				if consecutiveErrors >= maxConsecutiveErrors {
+					fmt.Printf("\n⚠️  连续 %d 次拉取失败，尝试重连...\n", consecutiveErrors)
+					c2, p2, o2 := reconnect(brokerAddr, topic, group, partitions, offsets)
+					if c2 != nil {
+						c.Close()
+						c = c2
+						partitions = p2
+						offsets = o2
+						consecutiveErrors = 0
+						fmt.Printf("✅ 重连成功，继续消费\n\n")
+					} else {
+						log.Fatalf("❌ 重连失败，Broker 可能已关闭")
+					}
 				}
+				break // 出错了就跳出内层循环，等一轮再试
 			}
-			fmt.Printf("\n💾 已提交所有分区 offset\n")
+
+			for _, m := range msgs {
+				printMsg(&m)
+				offsets[p] = m.Offset + 1
+				totalMsgs++
+			}
+			if group != "" && len(msgs) > 0 {
+				c.CommitOffset(p, offsets[p])
+			}
 		}
+
+		if !hadError {
+			consecutiveErrors = 0
+		}
+
+		if totalMsgs == 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+// reconnect 尝试重新连接 Broker
+func reconnect(brokerAddr, topic, group string, oldPartitions []int, oldOffsets map[int]int64) (*client.ClientConsumer, []int, map[int]int64) {
+	for attempt := 1; attempt <= 5; attempt++ {
+		time.Sleep(time.Duration(attempt) * time.Second)
+		fmt.Printf("   重连第 %d 次...\n", attempt)
+
+		c, err := client.NewClientConsumer(brokerAddr, group, topic)
+		if err != nil {
+			continue
+		}
+
+		var partitions []int
+		if group != "" {
+			partitions, err = c.JoinGroup()
+			if err != nil {
+				c.Close()
+				continue
+			}
+			fmt.Printf("   分配分区: %v\n", partitions)
+		} else {
+			partitions = oldPartitions
+		}
+
+		if len(partitions) == 0 {
+			partitions = oldPartitions
+		}
+
+		// 恢复 offset：优先用旧的（内存中保存的），其次从 Broker 获取
+		offsets := make(map[int]int64)
+		for _, p := range partitions {
+			if oldOff, ok := oldOffsets[p]; ok && oldOff > 0 {
+				offsets[p] = oldOff // 用内存中保存的进度
+			} else if group != "" {
+				committed, err := c.FetchOffset(p)
+				if err == nil {
+					offsets[p] = committed
+				} else {
+					offsets[p] = 0
+				}
+			} else {
+				offsets[p] = 0
+			}
+		}
+
+		return c, partitions, offsets
+	}
+	return nil, nil, nil
+}
+
+// runOnce 一次性拉取
+func runOnce(c *client.ClientConsumer, partitions []int, offsets map[int]int64, group string, maxCount int) {
+	var allMsgs []protocol.FetchedMessage
+	for _, p := range partitions {
+		msgs, err := c.Poll(p, offsets[p], maxCount)
+		if err != nil {
+			log.Fatalf("❌ P%d 拉取失败: %v", p, err)
+		}
+		for _, m := range msgs {
+			offsets[p] = m.Offset + 1
+		}
+		allMsgs = append(allMsgs, msgs...)
+	}
+	if len(allMsgs) == 0 {
+		fmt.Println("📭 没有消息")
+		return
+	}
+	fmt.Printf("📥 拉取到 %d 条消息:\n", len(allMsgs))
+	for i := range allMsgs {
+		printMsg(&allMsgs[i])
+	}
+	if group != "" {
+		for _, p := range partitions {
+			if offsets[p] > 0 {
+				c.CommitOffset(p, offsets[p])
+			}
+		}
+		fmt.Printf("\n💾 已提交所有分区 offset\n")
 	}
 }
 
@@ -257,15 +343,12 @@ func runConsume() {
 
 // reorderArgs 把 -flag 参数移到非 flag 参数前面
 // Go 的 flag 包遇到第一个非 flag 参数就会停止解析
-// 所以 "orders -p 1" 需要重排为 "-p 1 orders"
 func reorderArgs(args []string) []string {
 	var flags, positional []string
 	for i := 0; i < len(args); i++ {
 		if strings.HasPrefix(args[i], "-") {
 			flags = append(flags, args[i])
-			// 如果是 -key value 形式，把 value 也带上
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				// 检查是不是 bool flag (如 -f)
 				if !isBoolFlag(args[i]) {
 					i++
 					flags = append(flags, args[i])
