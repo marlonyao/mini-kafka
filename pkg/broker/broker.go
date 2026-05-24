@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
 	mini "github.com/marlonyao/mini-kafka/pkg"
@@ -66,6 +68,13 @@ func NewBroker(addr string, dataDir string) *Broker {
 
 // Start 启动 Broker（阻塞运行）
 func (b *Broker) Start() error {
+	// 如果配置了 dataDir，启动时恢复已有 topic
+	if b.dataDir != "" {
+		if err := b.loadTopicsFromDisk(); err != nil {
+			log.Printf("[Broker] warning: load topics from disk failed: %v", err)
+		}
+	}
+
 	var err error
 	b.listener, err = net.Listen("tcp", b.addr)
 	if err != nil {
@@ -266,7 +275,17 @@ func (b *Broker) handleCreateTopic(payload []byte) *protocol.Response {
 		return errorResponse("topic '%s' already exists", req.Name)
 	}
 
-	topic := mini.NewTopic(req.Name, req.NumPartitions)
+	var topic *mini.Topic
+	var err error
+	if b.dataDir != "" {
+		topic, err = mini.NewTopicWithDir(req.Name, req.NumPartitions, b.dataDir)
+		if err != nil {
+			return errorResponse("create topic '%s' failed: %v", req.Name, err)
+		}
+	} else {
+		topic = mini.NewTopic(req.Name, req.NumPartitions)
+	}
+
 	b.topics[req.Name] = topic
 	log.Printf("[Broker] created topic '%s' with %d partitions", req.Name, req.NumPartitions)
 
@@ -392,6 +411,60 @@ func (b *Broker) handleFetchOffset(payload []byte) *protocol.Response {
 }
 
 // ─── 辅助方法 ────────────────────────────────────
+
+// loadTopicsFromDisk 从 dataDir 恢复已有 topic
+//
+// 目录结构: dataDir/<topicName>/partition-<N>/
+func (b *Broker) loadTopicsFromDisk() error {
+	entries, err := os.ReadDir(b.dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 目录不存在，首次启动
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		topicName := entry.Name()
+
+		// 扫描 topic 目录下的 partition-* 子目录来确定分区数
+		partEntries, err := os.ReadDir(filepath.Join(b.dataDir, topicName))
+		if err != nil {
+			continue
+		}
+
+		maxPartition := -1
+		for _, pe := range partEntries {
+			if pe.IsDir() {
+				var pID int
+				if _, err := fmt.Sscanf(pe.Name(), "partition-%d", &pID); err == nil {
+					if pID > maxPartition {
+						maxPartition = pID
+					}
+			}
+		}
+		}
+
+		if maxPartition < 0 {
+			continue // 没有分区目录
+		}
+
+		numPartitions := maxPartition + 1
+		topic, err := mini.NewTopicWithDir(topicName, numPartitions, b.dataDir)
+		if err != nil {
+			log.Printf("[Broker] warning: restore topic '%s' failed: %v", topicName, err)
+			continue
+		}
+
+		b.topics[topicName] = topic
+		log.Printf("[Broker] restored topic '%s' (%d partitions) from disk", topicName, numPartitions)
+	}
+
+	return nil
+}
 
 // removeConsumerFromGroup 从消费者组中移除消费者（连接断开时调用）
 func (b *Broker) removeConsumerFromGroup(groupID, addr string) {

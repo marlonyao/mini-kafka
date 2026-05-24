@@ -13,6 +13,7 @@ package mini_kafka
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync/atomic"
 
 	"github.com/marlonyao/mini-kafka/pkg/message"
@@ -25,7 +26,7 @@ type Topic struct {
 	rrCounter  atomic.Int64            // 轮询计数器（原子操作，并发安全）
 }
 
-// NewTopic 创建新 Topic
+// NewTopic 创建新 Topic（纯内存模式，数据存在临时目录）
 func NewTopic(name string, numPartitions int) *Topic {
 	partitions := make(map[int]*Partition, numPartitions)
 	for i := 0; i < numPartitions; i++ {
@@ -35,6 +36,26 @@ func NewTopic(name string, numPartitions int) *Topic {
 		name:       name,
 		partitions: partitions,
 	}
+}
+
+// NewTopicWithDir 创建带持久化的 Topic
+//
+// dataDir: 数据根目录，每个 topic/partition 会创建子目录
+// 启动时会自动加载已有数据并恢复状态。
+func NewTopicWithDir(name string, numPartitions int, dataDir string) (*Topic, error) {
+	partitions := make(map[int]*Partition, numPartitions)
+	for i := 0; i < numPartitions; i++ {
+		pDir := filepath.Join(dataDir, name, fmt.Sprintf("partition-%d", i))
+		p, err := NewPartitionWithDir(i, pDir)
+		if err != nil {
+			return nil, fmt.Errorf("create partition %d: %w", i, err)
+		}
+		partitions[i] = p
+	}
+	return &Topic{
+		name:       name,
+		partitions: partitions,
+	}, nil
 }
 
 // Name 返回 Topic 名称
