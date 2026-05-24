@@ -11,13 +11,13 @@
 | 3 | Consumer + ConsumerGroup + Offset | 拉取模型, 位移管理, 组内负载均衡 |
 | 4 | Rebalance 再均衡 | 消费者变动时分区重分配 |
 | 5 | 消息持久化 + 日志分段 | 顺序写, Segment 滚动, 日志清理 |
+| 6 | Broker/Client 网络架构 | TCP 协议, 请求/响应, Client/Server 模式 |
 
 ## 运行测试
 
 ```bash
 cd mini-kafka
-pip install pytest
-pytest tests/ -v
+go test ./pkg/... -v
 ```
 
 ## 学习方法
